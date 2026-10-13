@@ -1,0 +1,90 @@
+name: Release agent
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build/publish (e.g. v1.2.3)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    name: Build Windows installers
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.20.13"
+
+      - name: Install tools
+        shell: pwsh
+        run: |
+          go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.4.0
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build agent and installers
+        shell: pwsh
+        run: |
+          $ver = $env:RELEASE_TAG.TrimStart("v")
+          New-Item -ItemType Directory -Force dist | Out-Null
+          # icon files are not part of the public repo
+          (Get-Content versioninfo.json) | Where-Object { $_ -notmatch '"IconPath"' } | Set-Content versioninfo.ci.json
+          foreach ($arch in @("amd64", "386")) {
+            $out = Join-Path $pwd "out\$arch"
+            New-Item -ItemType Directory -Force $out | Out-Null
+            Remove-Item -ErrorAction SilentlyContinue resource.syso
+            if ($arch -eq "amd64") { goversioninfo -64 versioninfo.ci.json } else { goversioninfo versioninfo.ci.json }
+            $env:CGO_ENABLED = "0"; $env:GOOS = "windows"; $env:GOARCH = $arch
+            go build -ldflags "-s -w" -o "$out\tacticalrmm.exe"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+
+            $iss = Get-Content build\setup.iss -Raw
+            $iss = $iss -replace '(?m)^(SetupIconFile|WizardSmallImageFile)=.*\r?\n', ''
+            $iss = $iss.Replace('C:\Users\Public\Documents\agent\tacticalrmm.exe', "$out\tacticalrmm.exe")
+            Set-Content -Path "build\setup-$arch.iss" -Value $iss
+            & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /O"dist" /F"tacticalagent-v$ver-windows-$arch" "build\setup-$arch.iss"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          Remove-Item -ErrorAction SilentlyContinue resource.syso
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: dist/*.exe
+
+  unix:
+    runs-on: ubuntu-latest
+    name: Build Linux/Mac binaries
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.20.13"
+
+      - name: Build
+        run: |
+          VER="${RELEASE_TAG#v}"
+          mkdir -p dist
+          for target in linux/amd64 linux/386 linux/arm64 linux/arm darwin/amd64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            env CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -ldflags "-s -w" -o "dist/tacticalagent-v${VER}-${os}-${arch}"
+          done
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: dist/*
